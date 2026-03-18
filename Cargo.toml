@@ -1,0 +1,10 @@
+[package]
+name = "md2pdf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pulldown-cmark = "0.12"
+printpdf = "0.7"
+lopdf = "0.31"
+clap = { version = "4", features = ["derive"] }
