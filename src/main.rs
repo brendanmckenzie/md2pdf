@@ -364,7 +364,9 @@ const HEADING_SIZES: [f32; 6] = [24.0, 20.0, 16.0, 14.0, 12.0, 11.0];
 const LINE_H: f32 = 5.5;
 const PARA_GAP: f32 = 3.0;
 const CODE_LINE_H: f32 = 4.5;
-const TABLE_ROW_H: f32 = 6.5;
+const TABLE_ROW_H: f32 = 6.5;   // minimum single-line row height
+const TABLE_LINE_H: f32 = 4.2;  // line-to-line spacing within a cell
+const TABLE_CELL_PAD_V: f32 = 1.5; // vertical padding above/below cell text
 const TABLE_PAD: f32 = 1.5;
 
 fn black() -> Color { Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)) }
@@ -674,7 +676,7 @@ impl Renderer {
             Self::wrap_cell(&headers[c], available)
         }).collect();
         let header_line_count = header_lines.iter().map(|l| l.len()).max().unwrap_or(1);
-        let header_h = header_line_count as f32 * TABLE_ROW_H;
+        let header_h = (TABLE_CELL_PAD_V * 2.0 + header_line_count as f32 * TABLE_LINE_H).max(TABLE_ROW_H);
 
         let body_wrapped: Vec<Vec<Vec<String>>> = rows.iter().map(|row| {
             (0..ncols).map(|c| {
@@ -684,7 +686,7 @@ impl Renderer {
         }).collect();
         let row_heights: Vec<f32> = body_wrapped.iter().map(|row| {
             let max_lines = row.iter().map(|cell| cell.len()).max().unwrap_or(1);
-            max_lines as f32 * TABLE_ROW_H
+            (TABLE_CELL_PAD_V * 2.0 + max_lines as f32 * TABLE_LINE_H).max(TABLE_ROW_H)
         }).collect();
 
         let table_h = header_h + row_heights.iter().sum::<f32>();
@@ -712,7 +714,7 @@ impl Renderer {
             for (c, lines) in header_lines.iter().enumerate() {
                 let cell_x = col_x + TABLE_PAD;
                 for (li, line) in lines.iter().enumerate() {
-                    let y_pos = self.by(table_top + (li as f32 + 0.75) * TABLE_ROW_H);
+                    let y_pos = self.by(table_top + TABLE_CELL_PAD_V + (li as f32 + 0.82) * TABLE_LINE_H);
                     let layer = self.current_layer();
                     layer.begin_text_section();
                     layer.set_font(&self.sans.bold, TABLE_SIZE);
@@ -744,7 +746,7 @@ impl Renderer {
             for (c, lines) in row_cells.iter().enumerate() {
                 let cell_x = col_x + TABLE_PAD;
                 for (li, line) in lines.iter().enumerate() {
-                    let y_pos = self.by(row_top + (li as f32 + 0.75) * TABLE_ROW_H);
+                    let y_pos = self.by(row_top + TABLE_CELL_PAD_V + (li as f32 + 0.82) * TABLE_LINE_H);
                     let layer = self.current_layer();
                     layer.begin_text_section();
                     layer.set_font(&self.sans.regular, TABLE_SIZE);
@@ -866,6 +868,9 @@ impl Renderer {
 
             Block::Paragraph(spans) => {
                 if let Some(m) = marker {
+                    // Ensure space before drawing the marker so it doesn't end
+                    // up on a different page than the paragraph text.
+                    self.ensure_space(LINE_H);
                     // SAFETY: body_fonts points into self which we hold mutably;
                     // the reference is only used before any mutation below.
                     let bf = unsafe { &*body_fonts };
