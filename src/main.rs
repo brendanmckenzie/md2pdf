@@ -596,6 +596,57 @@ impl Renderer {
 
     // ── Table rendering ───────────────────────────────────────────────────────
 
+    /// Ideal single-line width for a cell (including padding).
+    fn cell_ideal_w(spans: &[Span]) -> f32 {
+        let mut w = 0.0_f32;
+        let mut first = true;
+        for (text, _, _, mono) in Self::flatten(spans, false, false, false) {
+            for word in text.split_whitespace() {
+                let cw = Self::char_w(TABLE_SIZE, mono);
+                let ww = word.chars().count() as f32 * cw;
+                if !first { w += cw; }
+                w += ww;
+                first = false;
+            }
+        }
+        w + TABLE_PAD * 2.0
+    }
+
+    /// Wrap cell text into lines fitting within `available_w` (inner, no padding).
+    fn wrap_cell(spans: &[Span], available_w: f32) -> Vec<String> {
+        let segs = Self::flatten(spans, false, false, false);
+        let mut words: Vec<(String, bool)> = Vec::new();
+        for (text, _, _, mono) in &segs {
+            for word in text.split_whitespace() {
+                words.push((word.to_owned(), *mono));
+            }
+        }
+        if words.is_empty() {
+            return vec![String::new()];
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut cur_line = String::new();
+        let mut cur_w = 0.0_f32;
+        for (word, mono) in &words {
+            let cw = Self::char_w(TABLE_SIZE, *mono);
+            let ww = word.chars().count() as f32 * cw;
+            let sw = if cur_line.is_empty() { 0.0 } else { cw };
+            if !cur_line.is_empty() && cur_w + sw + ww > available_w {
+                lines.push(std::mem::take(&mut cur_line));
+                cur_line = word.clone();
+                cur_w = ww;
+            } else {
+                if !cur_line.is_empty() { cur_line.push(' '); }
+                cur_line.push_str(word);
+                cur_w += sw + ww;
+            }
+        }
+        if !cur_line.is_empty() {
+            lines.push(cur_line);
+        }
+        lines
+    }
+
     fn render_table(
         &mut self,
         headers: &[Vec<Span>],
@@ -604,10 +655,39 @@ impl Renderer {
     ) {
         if headers.is_empty() { return; }
         let ncols = headers.len();
-        let col_w = self.content_w / ncols as f32;
-        let total_rows = 1 + rows.len();
-        let table_h = total_rows as f32 * TABLE_ROW_H;
 
+        // ── Compute proportional column widths ────────────────────────────────
+        let min_col_w = TABLE_PAD * 2.0 + Self::char_w(TABLE_SIZE, false) * 4.0;
+        let ideal: Vec<f32> = (0..ncols).map(|c| {
+            let hdr_w = Self::cell_ideal_w(&headers[c]);
+            let body_w = rows.iter()
+                .map(|row| row.get(c).map_or(0.0, |cell| Self::cell_ideal_w(cell)))
+                .fold(0.0_f32, f32::max);
+            hdr_w.max(body_w).max(min_col_w)
+        }).collect();
+        let ideal_sum: f32 = ideal.iter().sum();
+        let col_ws: Vec<f32> = ideal.iter().map(|w| w / ideal_sum * self.content_w).collect();
+
+        // ── Pre-wrap all cells and compute row heights ────────────────────────
+        let header_lines: Vec<Vec<String>> = (0..ncols).map(|c| {
+            let available = (col_ws[c] - TABLE_PAD * 2.0).max(1.0);
+            Self::wrap_cell(&headers[c], available)
+        }).collect();
+        let header_line_count = header_lines.iter().map(|l| l.len()).max().unwrap_or(1);
+        let header_h = header_line_count as f32 * TABLE_ROW_H;
+
+        let body_wrapped: Vec<Vec<Vec<String>>> = rows.iter().map(|row| {
+            (0..ncols).map(|c| {
+                let available = (col_ws[c] - TABLE_PAD * 2.0).max(1.0);
+                row.get(c).map_or_else(|| vec![String::new()], |cell| Self::wrap_cell(cell, available))
+            }).collect()
+        }).collect();
+        let row_heights: Vec<f32> = body_wrapped.iter().map(|row| {
+            let max_lines = row.iter().map(|cell| cell.len()).max().unwrap_or(1);
+            max_lines as f32 * TABLE_ROW_H
+        }).collect();
+
+        let table_h = header_h + row_heights.iter().sum::<f32>();
         self.ensure_space(table_h + PARA_GAP);
 
         let table_top = self.y;
@@ -622,73 +702,59 @@ impl Renderer {
             layer.set_outline_thickness(0.3);
             layer.add_rect(Rect::new(
                 Mm(table_left),
-                self.by(table_top + TABLE_ROW_H),
+                self.by(table_top + header_h),
                 Mm(table_right),
                 self.by(table_top),
             ));
             self.reset_colors();
 
-            for (c, cell_spans) in headers.iter().enumerate() {
-                let cell_x = table_left + c as f32 * col_w + TABLE_PAD;
-                let text: String = Self::flatten(cell_spans, false, false, false)
-                    .into_iter().map(|(t, ..)| t).collect::<Vec<_>>().join("");
-                let y_pos = self.by(table_top + TABLE_ROW_H * 0.68);
-                let layer = self.current_layer();
-                layer.begin_text_section();
-                layer.set_font(&self.sans.bold, TABLE_SIZE);
-                layer.set_text_cursor(Mm(cell_x), y_pos);
-                layer.write_text(&text, &self.sans.bold);
-                layer.end_text_section();
+            let mut col_x = table_left;
+            for (c, lines) in header_lines.iter().enumerate() {
+                let cell_x = col_x + TABLE_PAD;
+                for (li, line) in lines.iter().enumerate() {
+                    let y_pos = self.by(table_top + (li as f32 + 0.75) * TABLE_ROW_H);
+                    let layer = self.current_layer();
+                    layer.begin_text_section();
+                    layer.set_font(&self.sans.bold, TABLE_SIZE);
+                    layer.set_text_cursor(Mm(cell_x), y_pos);
+                    layer.write_text(line, &self.sans.bold);
+                    layer.end_text_section();
+                }
+                col_x += col_ws[c];
             }
         }
 
         // ── Body rows ─────────────────────────────────────────────────────────
-        for (r, row) in rows.iter().enumerate() {
-            let row_top = table_top + (r + 1) as f32 * TABLE_ROW_H;
-
+        let mut row_top = table_top + header_h;
+        for (r, (row_cells, &row_h)) in body_wrapped.iter().zip(row_heights.iter()).enumerate() {
             if r % 2 == 1 {
                 let layer = self.current_layer();
                 layer.set_fill_color(grey(0.96));
                 layer.set_outline_thickness(0.0);
                 layer.add_rect(Rect::new(
                     Mm(table_left),
-                    self.by(row_top + TABLE_ROW_H),
+                    self.by(row_top + row_h),
                     Mm(table_right),
                     self.by(row_top),
                 ));
                 self.reset_colors();
             }
 
-            for (c, cell_spans) in row.iter().enumerate() {
-                let cell_x = table_left + c as f32 * col_w + TABLE_PAD;
-                let cell_w = col_w - TABLE_PAD * 2.0;
-
-                // Single-line with ellipsis truncation
-                let mut text = String::new();
-                let mut w = 0.0_f32;
-                'outer: for (t, _, _, mono) in Self::flatten(cell_spans, false, false, false) {
-                    for word in t.split_whitespace() {
-                        let cw = Self::char_w(TABLE_SIZE, mono);
-                        let ww = word.chars().count() as f32 * cw;
-                        if !text.is_empty() { w += cw; }
-                        if w + ww > cell_w && !text.is_empty() {
-                            text.push('…');
-                            break 'outer;
-                        }
-                        if !text.is_empty() { text.push(' '); }
-                        text.push_str(word);
-                        w += ww;
-                    }
+            let mut col_x = table_left;
+            for (c, lines) in row_cells.iter().enumerate() {
+                let cell_x = col_x + TABLE_PAD;
+                for (li, line) in lines.iter().enumerate() {
+                    let y_pos = self.by(row_top + (li as f32 + 0.75) * TABLE_ROW_H);
+                    let layer = self.current_layer();
+                    layer.begin_text_section();
+                    layer.set_font(&self.sans.regular, TABLE_SIZE);
+                    layer.set_text_cursor(Mm(cell_x), y_pos);
+                    layer.write_text(line, &self.sans.regular);
+                    layer.end_text_section();
                 }
-
-                let y_pos = self.by(row_top + TABLE_ROW_H * 0.68);
-                let layer = self.current_layer();
-                layer.begin_text_section();
-                layer.set_font(&self.sans.regular, TABLE_SIZE);
-                layer.set_text_cursor(Mm(cell_x), y_pos);
-                layer.write_text(&text, &self.sans.regular);
-                layer.end_text_section();
+                col_x += col_ws[c];
             }
+            row_top += row_h;
         }
 
         // ── Grid lines ────────────────────────────────────────────────────────
@@ -696,20 +762,38 @@ impl Renderer {
         layer.set_outline_color(grey(0.60));
         layer.set_outline_thickness(0.3);
 
-        for r in 0..=total_rows {
-            let ry = self.by(table_top + r as f32 * TABLE_ROW_H);
+        // Horizontal lines
+        layer.add_line(Line {
+            points: vec![
+                (Point::new(Mm(table_left), self.by(table_top)), false),
+                (Point::new(Mm(table_right), self.by(table_top)), false),
+            ],
+            is_closed: false,
+        });
+        let mut ry = table_top + header_h;
+        layer.add_line(Line {
+            points: vec![
+                (Point::new(Mm(table_left), self.by(ry)), false),
+                (Point::new(Mm(table_right), self.by(ry)), false),
+            ],
+            is_closed: false,
+        });
+        for &row_h in &row_heights {
+            ry += row_h;
             layer.add_line(Line {
                 points: vec![
-                    (Point::new(Mm(table_left), ry), false),
-                    (Point::new(Mm(table_right), ry), false),
+                    (Point::new(Mm(table_left), self.by(ry)), false),
+                    (Point::new(Mm(table_right), self.by(ry)), false),
                 ],
                 is_closed: false,
             });
         }
+
+        // Vertical lines
         let grid_top = self.by(table_top);
         let grid_bot = self.by(table_top + table_h);
+        let mut cx = table_left;
         for c in 0..=ncols {
-            let cx = table_left + c as f32 * col_w;
             layer.add_line(Line {
                 points: vec![
                     (Point::new(Mm(cx), grid_top), false),
@@ -717,6 +801,7 @@ impl Renderer {
                 ],
                 is_closed: false,
             });
+            if c < ncols { cx += col_ws[c]; }
         }
 
         self.reset_colors();
