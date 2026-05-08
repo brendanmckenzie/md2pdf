@@ -263,14 +263,21 @@ impl Renderer {
             layer.begin_text_section();
             layer.set_text_cursor(Mm(self.margin + indent), y_pos);
             let mut first = true;
+            // Always write the separator space using the body regular font so
+            // that inline code tokens (mono) don't introduce a wider mono space
+            // — which reads as extra horizontal padding around `code`.
+            let sep_font = body_fonts.choose(false, false);
             for tok in line {
                 let font = if tok.mono {
                     self.mono.choose(tok.bold, tok.italic)
                 } else {
                     body_fonts.choose(tok.bold, tok.italic)
                 };
+                if !first {
+                    layer.set_font(sep_font, size);
+                    layer.write_text(" ", sep_font);
+                }
                 layer.set_font(font, size);
-                if !first { layer.write_text(" ", font); }
                 layer.write_text(tok.text, font);
                 first = false;
             }
@@ -509,11 +516,39 @@ impl Renderer {
                 let lh = size * 0.353 * 1.4;
                 let top_gap = if *level == 1 { 6.0 } else { 4.0 };
 
-                self.ensure_space(top_gap + lh + PARA_GAP);
+                let text: String = Self::flatten(spans, false, false, false)
+                    .into_iter().map(|(t, ..)| t).collect::<Vec<_>>().join("");
+
+                // Word-wrap the heading so long titles don't run off the page.
+                // Heading font is bold sans; estimate width with the same
+                // char_w model used elsewhere.
+                let avail_w = self.content_w - indent;
+                let cw = Self::char_w(size, false);
+                let mut wrapped: Vec<String> = Vec::new();
+                let mut cur = String::new();
+                let mut cur_w = 0.0_f32;
+                for word in text.split_whitespace() {
+                    let ww = word.chars().count() as f32 * cw;
+                    let sw = if cur.is_empty() { 0.0 } else { cw };
+                    if !cur.is_empty() && cur_w + sw + ww > avail_w {
+                        wrapped.push(std::mem::take(&mut cur));
+                        cur = word.to_owned();
+                        cur_w = ww;
+                    } else {
+                        if !cur.is_empty() { cur.push(' '); }
+                        cur.push_str(word);
+                        cur_w += sw + ww;
+                    }
+                }
+                if !cur.is_empty() { wrapped.push(cur); }
+                if wrapped.is_empty() { wrapped.push(String::new()); }
+
+                let total_h = wrapped.len() as f32 * lh;
+                self.ensure_space(top_gap + total_h + PARA_GAP);
                 self.y += top_gap;
 
                 if *level <= 2 {
-                    let ry = self.by(self.y + lh + 1.5);
+                    let ry = self.by(self.y + total_h + 1.5);
                     let layer = self.current_layer();
                     layer.set_outline_color(grey(0.75));
                     layer.set_outline_thickness(0.3);
@@ -527,26 +562,26 @@ impl Renderer {
                     self.reset_colors();
                 }
 
-                let text: String = Self::flatten(spans, false, false, false)
-                    .into_iter().map(|(t, ..)| t).collect::<Vec<_>>().join("");
-
                 // Record position for the PDF outline (before advancing y).
                 self.headings.push(HeadingPos {
-                    title: text.clone(),
+                    title: text,
                     level: *level,
                     page_idx: self.page_num,
                     y_top_mm: self.y,
                 });
 
-                let y_pos = self.by(self.y + lh * 0.8);
-                let layer = self.current_layer();
-                layer.begin_text_section();
-                layer.set_font(&self.sans.bold, size);
-                layer.set_text_cursor(Mm(self.margin + indent), y_pos);
-                layer.write_text(&text, &self.sans.bold);
-                layer.end_text_section();
+                for line in &wrapped {
+                    let y_pos = self.by(self.y + lh * 0.8);
+                    let layer = self.current_layer();
+                    layer.begin_text_section();
+                    layer.set_font(&self.sans.bold, size);
+                    layer.set_text_cursor(Mm(self.margin + indent), y_pos);
+                    layer.write_text(line, &self.sans.bold);
+                    layer.end_text_section();
+                    self.y += lh;
+                }
 
-                self.y += lh + PARA_GAP;
+                self.y += PARA_GAP;
             }
 
             Block::Paragraph(spans) => {
