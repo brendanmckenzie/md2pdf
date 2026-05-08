@@ -30,6 +30,7 @@ enum SpanContext {
     Bold(Vec<Span>),
     Italic(Vec<Span>),
     Link { url: String, spans: Vec<Span> },
+    Image { url: String, alt: String },
     CodeBlock { lang: Option<String>, code: String },
     TableCell(Vec<Span>),
 }
@@ -43,6 +44,12 @@ impl ModelBuilder {
     }
 
     fn push_span(&mut self, s: Span) {
+        // Inside an Image, inline text events form the alt text — capture them
+        // there rather than treating them as a normal span child.
+        if let Some(SpanContext::Image { alt, .. }) = self.span_stack.last_mut() {
+            if let Span::Text(t) = &s { alt.push_str(t); }
+            return;
+        }
         // Tight list items emit inline events directly inside Item with no
         // enclosing Paragraph tag. Auto-create one so content isn't dropped.
         if self.span_stack.is_empty() {
@@ -232,6 +239,12 @@ pub fn parse_markdown(src: &str) -> Vec<Block> {
                     spans: Vec::new(),
                 });
             }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                mb.span_stack.push(SpanContext::Image {
+                    url: dest_url.to_string(),
+                    alt: String::new(),
+                });
+            }
 
             // ── Inline closes ────────────────────────────────────────────────
             Event::End(TagEnd::Strong) => {
@@ -248,6 +261,11 @@ pub fn parse_markdown(src: &str) -> Vec<Block> {
                 if let Some(SpanContext::Link { url, spans }) = mb.span_stack.pop() {
                     let display_url = if url.starts_with('#') { None } else { Some(url) };
                     mb.push_span(Span::Link { label: spans, url: display_url });
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some(SpanContext::Image { url, alt }) = mb.span_stack.pop() {
+                    mb.push_span(Span::Image { path: url, alt });
                 }
             }
 

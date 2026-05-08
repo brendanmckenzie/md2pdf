@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 pulldown-cmark = "0.12"
-printpdf = "0.7"
+printpdf = { version = "0.7", features = ["embedded_images"] }
 lopdf = "0.31"
 clap = { version = "4", features = ["derive"] }
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }

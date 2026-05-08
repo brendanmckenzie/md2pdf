@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use printpdf::*;
 use pulldown_cmark::Alignment;
 
@@ -28,6 +30,24 @@ const TABLE_PAD: f32 = 1.5;
 
 fn black() -> Color { Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)) }
 fn grey(v: f32) -> Color { Color::Rgb(Rgb::new(v, v, v, None)) }
+
+/// Composite an image onto an opaque white background and return RGB8 pixels.
+/// See call site for why this is necessary.
+fn flatten_to_rgb(img: &::image::DynamicImage) -> ::image::RgbImage {
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut out = ::image::RgbImage::new(w, h);
+    for (x, y, px) in rgba.enumerate_pixels() {
+        let [r, g, b, a] = px.0;
+        let a = a as f32 / 255.0;
+        let blend = |c: u8| -> u8 {
+            let v = c as f32 * a + 255.0 * (1.0 - a);
+            v.round().clamp(0.0, 255.0) as u8
+        };
+        out.put_pixel(x, y, ::image::Rgb([blend(r), blend(g), blend(b)]));
+    }
+    out
+}
 
 // ── Font sets ─────────────────────────────────────────────────────────────────
 
@@ -94,6 +114,9 @@ pub struct Renderer {
     headings: Vec<HeadingPos>,
     /// 0-based count of the current page (incremented each time we call new_page).
     page_num: usize,
+
+    /// Directory used to resolve relative image paths.
+    base_dir: PathBuf,
 }
 
 impl Renderer {
@@ -103,13 +126,14 @@ impl Renderer {
         serif_family: &FontFamily,
         mono_family: &FontFamily,
         margin: f32,
+        base_dir: PathBuf,
     ) -> Self {
         let (doc, page, layer) = PdfDocument::new(title, Mm(PG_W), Mm(PG_H), "Layer 1");
         let sans = FontSet::load(&doc, sans_family);
         let serif = FontSet::load(&doc, serif_family);
         let mono = FontSet::load(&doc, mono_family);
         let content_w = PG_W - 2.0 * margin;
-        Self { doc, page, layer, y: margin, margin, content_w, sans, serif, mono, headings: Vec::new(), page_num: 0 }
+        Self { doc, page, layer, y: margin, margin, content_w, sans, serif, mono, headings: Vec::new(), page_num: 0, base_dir }
     }
 
     fn current_layer(&self) -> PdfLayerReference {
@@ -167,6 +191,12 @@ impl Renderer {
                         }
                     }
                     out.extend(inner);
+                }
+                Span::Image { alt, .. } => {
+                    // Fallback: when an image appears outside paragraph-level
+                    // (e.g. nested in a link or inside a table cell) emit its
+                    // alt text in italic so something readable remains.
+                    if !alt.is_empty() { out.push((alt.clone(), b, true, m)); }
                 }
                 Span::SoftBreak => out.push((" ".to_string(), b, i, m)),
                 Span::HardBreak => out.push(("\n".to_string(), b, i, m)),
@@ -520,23 +550,51 @@ impl Renderer {
             }
 
             Block::Paragraph(spans) => {
-                if let Some(m) = marker {
-                    // Ensure space before drawing the marker so it doesn't end
-                    // up on a different page than the paragraph text.
-                    self.ensure_space(LINE_H);
-                    // SAFETY: body_fonts points into self which we hold mutably;
-                    // the reference is only used before any mutation below.
-                    let bf = unsafe { &*body_fonts };
-                    let y_pos = self.by(self.y + LINE_H * 0.75);
-                    let layer = self.current_layer();
-                    layer.begin_text_section();
-                    layer.set_font(&bf.regular, BODY_SIZE);
-                    layer.set_text_cursor(Mm(self.margin + indent - 5.0), y_pos);
-                    layer.write_text(m, &bf.regular);
-                    layer.end_text_section();
+                // Split the paragraph at any top-level image span and render
+                // each image as its own block — this matches typical Markdown
+                // usage of `![alt](path)` on its own line as a figure.
+                enum Chunk<'a> { Text(Vec<&'a Span>), Image(&'a str, &'a str) }
+                let mut chunks: Vec<Chunk> = Vec::new();
+                let mut buf: Vec<&Span> = Vec::new();
+                for s in spans {
+                    if let Span::Image { path, alt } = s {
+                        if !buf.is_empty() {
+                            chunks.push(Chunk::Text(std::mem::take(&mut buf)));
+                        }
+                        chunks.push(Chunk::Image(path, alt));
+                    } else {
+                        buf.push(s);
+                    }
                 }
-                let bf = unsafe { &*body_fonts };
-                self.render_paragraph(spans, BODY_SIZE, indent, self.content_w - indent, bf);
+                if !buf.is_empty() { chunks.push(Chunk::Text(buf)); }
+
+                let mut first = true;
+                for chunk in chunks {
+                    match chunk {
+                        Chunk::Text(refs) => {
+                            let owned: Vec<Span> = refs.into_iter().cloned().collect();
+                            if first {
+                                if let Some(m) = marker {
+                                    self.ensure_space(LINE_H);
+                                    let bf = unsafe { &*body_fonts };
+                                    let y_pos = self.by(self.y + LINE_H * 0.75);
+                                    let layer = self.current_layer();
+                                    layer.begin_text_section();
+                                    layer.set_font(&bf.regular, BODY_SIZE);
+                                    layer.set_text_cursor(Mm(self.margin + indent - 5.0), y_pos);
+                                    layer.write_text(m, &bf.regular);
+                                    layer.end_text_section();
+                                }
+                            }
+                            let bf = unsafe { &*body_fonts };
+                            self.render_paragraph(&owned, BODY_SIZE, indent, self.content_w - indent, bf);
+                        }
+                        Chunk::Image(path, alt) => {
+                            self.render_image(path, alt, indent);
+                        }
+                    }
+                    first = false;
+                }
                 self.y += PARA_GAP;
             }
 
@@ -634,6 +692,81 @@ impl Renderer {
                 self.y += 3.0 + PARA_GAP;
             }
         }
+    }
+
+    // ── Image rendering ───────────────────────────────────────────────────────
+
+    fn render_image(&mut self, rel_path: &str, alt: &str, indent: f32) {
+        let full_path = self.base_dir.join(rel_path);
+        let bytes = match std::fs::read(&full_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warning: image {} not read: {}", full_path.display(), e);
+                self.render_image_fallback(alt, indent);
+                return;
+            }
+        };
+        let dyn_img = match ::image::load_from_memory(&bytes) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("warning: image {} not decoded: {}", full_path.display(), e);
+                self.render_image_fallback(alt, indent);
+                return;
+            }
+        };
+
+        // printpdf 0.7 emits RGBA images with an inline-stream /SMask dict that
+        // breaks the lopdf round-trip used for the PDF outline (the image
+        // XObject silently fails to re-load and the page resource ends up
+        // dangling). Flatten the alpha against white so we ship a plain RGB
+        // image — PNG/JPEG plots from matplotlib have white backgrounds, so
+        // this is visually identical for the report case and works correctly
+        // through the outline injection step.
+        let dyn_img = ::image::DynamicImage::ImageRgb8(flatten_to_rgb(&dyn_img));
+
+        let px_w = dyn_img.width().max(1) as f32;
+        let px_h = dyn_img.height().max(1) as f32;
+        let aspect = px_h / px_w;
+
+        // Fit width to the available column, capping height so a single image
+        // never exceeds 80% of the printable page height.
+        let avail_w = (self.content_w - indent).max(20.0);
+        let max_h = (PG_H - 2.0 * self.margin) * 0.85;
+        let mut w_mm = avail_w;
+        let mut h_mm = w_mm * aspect;
+        if h_mm > max_h {
+            h_mm = max_h;
+            w_mm = h_mm / aspect;
+        }
+
+        // If we don't have room on the current page, push to the next.
+        if self.y + h_mm > PG_H - self.margin {
+            self.new_page();
+        }
+
+        // dpi chosen so px_w / dpi * 25.4 == w_mm.
+        let dpi = px_w * 25.4 / w_mm;
+
+        let pdf_img = Image::from_dynamic_image(&dyn_img);
+        let layer = self.current_layer();
+        pdf_img.add_to_layer(layer, ImageTransform {
+            translate_x: Some(Mm(self.margin + indent)),
+            translate_y: Some(self.by(self.y + h_mm)),
+            rotate: None,
+            scale_x: Some(1.0),
+            scale_y: Some(1.0),
+            dpi: Some(dpi),
+        });
+        self.reset_colors();
+        self.y += h_mm;
+    }
+
+    fn render_image_fallback(&mut self, alt: &str, indent: f32) {
+        let label = if alt.is_empty() { "[image]".to_string() } else { format!("[image: {}]", alt) };
+        let spans = vec![Span::Italic(vec![Span::Text(label)])];
+        let sans_ptr = &self.sans as *const FontSet;
+        let bf = unsafe { &*sans_ptr };
+        self.render_paragraph(&spans, BODY_SIZE, indent, self.content_w - indent, bf);
     }
 
     fn render_list_item(

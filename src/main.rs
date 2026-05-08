@@ -66,7 +66,12 @@ fn main() {
         .unwrap_or("document");
 
     let blocks = parse_markdown(&src);
-    let renderer = Renderer::new(title, &cli.sans, &cli.serif, &cli.mono, cli.margin);
+    let base_dir = cli
+        .input
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let renderer = Renderer::new(title, &cli.sans, &cli.serif, &cli.mono, cli.margin, base_dir);
     let pdf_bytes = renderer.render(&blocks);
 
     let mut file = File::create(&output).unwrap_or_else(|e| {

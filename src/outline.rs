@@ -29,6 +29,13 @@ pub fn inject_outline(pdf_bytes: Vec<u8>, headings: &[HeadingPos]) -> Vec<u8> {
     let mut doc = lopdf::Document::load_mem(&pdf_bytes)
         .expect("lopdf failed to parse printpdf output");
 
+    // Force traditional xref table output. printpdf emits a cross-reference
+    // stream which lopdf can round-trip, but some PDF readers (and notably
+    // pdfimages) get confused by the resulting xref entries for image
+    // XObjects. Switching to the classic format keeps the byte-offset xref
+    // accurate after lopdf re-serializes.
+    doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
+
     // lopdf page map: 1-based page number → ObjectId
     let pages = doc.get_pages();
 

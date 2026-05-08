@@ -21,6 +21,7 @@ pub enum Span {
     Code(String),
     /// url is None for anchor links (#…) which are meaningless in PDF.
     Link { label: Vec<Span>, url: Option<String> },
+    Image { path: String, alt: String },
     SoftBreak,
     HardBreak,
 }
